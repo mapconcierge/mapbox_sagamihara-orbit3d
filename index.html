@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>相模原キャンパス 3D オービット</title>
+  <link href="https://api.mapbox.com/mapbox-gl-js/v3.10.0/mapbox-gl.css" rel="stylesheet">
+  <script src="https://api.mapbox.com/mapbox-gl-js/v3.10.0/mapbox-gl.js"></script>
+  <script src="config.js" onerror="void 0"></script>
+  <script src="processed/campus_paths.js" onerror="void 0"></script>
+  <style>
+    html, body { margin: 0; height: 100%; font-family: system-ui, -apple-system, "Hiragino Sans", sans-serif; }
+    #map { position: absolute; inset: 0; }
+    #panel {
+      position: absolute; top: 12px; left: 12px; z-index: 1; width: 230px;
+      background: rgba(255, 255, 255, .92); border-radius: 8px; padding: 10px 12px;
+      box-shadow: 0 1px 6px rgba(0, 0, 0, .3); font-size: 13px;
+    }
+    #panel h1 { font-size: 14px; margin: 0 0 8px; }
+    #panel label { display: block; margin-top: 8px; }
+    #panel input[type=range], #panel select, #panel button { width: 100%; box-sizing: border-box; }
+    #panel button { margin-top: 4px; padding: 6px; cursor: pointer; }
+    #msg { color: #b00; margin-top: 8px; display: none; }
+  </style>
+</head>
+<body>
+<div id="map"></div>
+<div id="panel">
+  <h1>相模原キャンパス 3D オービット</h1>
+  <button id="toggle">⏸ 一時停止</button>
+  <label>回転速度: <span id="speedVal">6</span>°/秒
+    <input id="speed" type="range" min="-30" max="30" step="1" value="6">
+  </label>
+  <label>ピッチ: <span id="pitchVal">65</span>°
+    <input id="pitch" type="range" min="0" max="85" step="1" value="65">
+  </label>
+  <label>ズーム: <span id="zoomVal">17</span>
+    <input id="zoom" type="range" min="15" max="19" step="0.1" value="17">
+  </label>
+  <label style="display:flex;gap:6px;align-items:center">
+    <input id="paths" type="checkbox" checked style="width:auto"> OSM 小道オーバーレイ
+  </label>
+  <label>小道データ源
+    <select id="pathMode">
+      <option value="ofm">OpenFreeMap（リアルタイム・ベクタータイル）</option>
+      <option value="overpass">OSM 事前取得（Overpass）</option>
+    </select>
+  </label>
+  <div id="legend" style="font-size:11px;line-height:1.6;margin-top:4px">
+    <span style="color:#e8590c">━ footway</span>　<span style="color:#7048e8">╌ steps</span><br>
+    <span style="color:#2f9e44">━ pedestrian</span>　<span style="color:#868e96">━ service</span><br>
+    <span style="color:#a0522d">╌ path/track</span>　<span style="color:#e03131">╌ 私道 access=private</span>
+  </div>
+  <label>スタイル
+    <select id="style">
+      <option value="mapbox://styles/mapbox/standard">Standard（3D建物）</option>
+      <option value="mapbox://styles/mapbox/standard-satellite">Standard Satellite</option>
+      <option value="mapbox://styles/mapbox/satellite-streets-v12">Satellite Streets（地形のみ）</option>
+    </select>
+  </label>
+  <div id="msg"></div>
+</div>
+<script>
+  // 中心: 私立青山学院大学相模原キャンパス（Mapbox Search Box POI より, WGS84 / EPSG:4326）
+  const CENTER = [139.40310, 35.56633];
+
+  const msg = document.getElementById('msg');
+  const token = window.MAPBOX_TOKEN || new URLSearchParams(location.search).get('token');
+  if (!token) {
+    msg.style.display = 'block';
+    msg.textContent = 'トークン未設定: config.js か ?token=pk.… を指定してください';
+    throw new Error('Mapbox token is not set');
+  }
+  mapboxgl.accessToken = token;
+
+  const map = new mapboxgl.Map({
+    container: 'map',
+    style: 'mapbox://styles/mapbox/standard',
+    center: CENTER,
+    zoom: 17,
+    pitch: 65,
+    bearing: 0,
+    projection: 'globe',
+    antialias: true
+  });
+  map.addControl(new mapboxgl.NavigationControl({ visualizePitch: true }), 'top-right');
+  map.addControl(new mapboxgl.ScaleControl({ unit: 'metric' }), 'bottom-left');
+
+  // 地形（Mapbox DEM）。Satellite Streets 等 Standard 以外のスタイルでも 3D になるよう毎回追加する
+  function addTerrain() {
+    if (!map.getSource('mapbox-dem')) {
+      map.addSource('mapbox-dem', {
+        type: 'raster-dem', url: 'mapbox://mapbox.mapbox-terrain-dem-v1', tileSize: 512, maxzoom: 14
+      });
+    }
+    map.setTerrain({ source: 'mapbox-dem', exaggeration: 1 });
+  }
+  // 小道オーバーレイ。データ源は2通り（パネルで切替）:
+  //  ofm      : OpenFreeMap のベクタータイル (OpenMapTiles スキーマの transportation レイヤー)。
+  //             表示中の範囲のタイルだけをリアルタイムに取得する (XYZ pbf, maxzoom 14 をオーバーズーム)。
+  //  overpass : 事前取得した OSM (processed/campus_paths.js, scripts/ 参照)。bbox 外は描けない。
+  // Standard スタイルは slot を持つ。'middle' に置くと道路の上・ラベルの下に描画される。
+  const cls = ['get', 'class'], sub = ['get', 'subclass'];
+  // transportation には歩行者広場などのポリゴンも含まれ、line で描くと外周が二重線になるため LineString のみ
+  const notIndoor = ['all', ['!=', ['get', 'indoor'], 1], ['==', ['geometry-type'], 'LineString']];
+  const PATH_LAYERS = [
+    { id: 'osm-service', color: '#868e96', w: [15, 1, 19, 5],
+      f: { ofm: ['==', cls, 'service'], overpass: ['==', ['get', 'highway'], 'service'] } },
+    { id: 'osm-pedestrian', color: '#2f9e44', w: [15, 1, 19, 5],
+      f: { ofm: ['all', ['==', cls, 'path'], ['==', sub, 'pedestrian']], overpass: ['==', ['get', 'highway'], 'pedestrian'] } },
+    { id: 'osm-footway', color: '#e8590c', w: [15, 0.8, 19, 3.5],
+      f: { ofm: ['all', ['==', cls, 'path'], ['==', sub, 'footway']], overpass: ['==', ['get', 'highway'], 'footway'] } },
+    { id: 'osm-steps', color: '#7048e8', w: [15, 1, 19, 4], dash: [1, 1],
+      f: { ofm: ['all', ['==', cls, 'path'], ['==', sub, 'steps']], overpass: ['==', ['get', 'highway'], 'steps'] } },
+    { id: 'osm-path', color: '#a0522d', w: [15, 1, 19, 4], dash: [2, 1.5],
+      f: { ofm: ['any', ['all', ['==', cls, 'path'], ['in', sub, ['literal', ['path', 'cycleway', 'bridleway']]]], ['==', cls, 'track']],
+           overpass: ['in', ['get', 'highway'], ['literal', ['path', 'track', 'cycleway']]] } },
+    // OpenMapTiles では access=private/no は access='no' に正規化される
+    { id: 'osm-private', color: '#e03131', w: [15, 1.5, 19, 5], dash: [2, 1.5],
+      f: { ofm: ['==', ['get', 'access'], 'no'], overpass: ['==', ['get', 'access'], 'private'] } }
+  ];
+  const PATH_SOURCES = {
+    ofm: { id: 'osm-paths-ofm', sourceLayer: 'transportation',
+      spec: () => ({ type: 'vector', url: 'https://tiles.openfreemap.org/planet' }) },  // 帰属は TileJSON から自動表示
+    overpass: { id: 'osm-paths-overpass',
+      // file:// でも動くよう <script> 版を優先し、無ければ fetch 用 URL にフォールバック
+      spec: () => ({ type: 'geojson', data: window.CAMPUS_PATHS || 'processed/campus_paths.geojson',
+        attribution: '© <a href="https://www.openstreetmap.org/copyright" target="_blank">OpenStreetMap contributors</a> (ODbL)' }) }
+  };
+  let pathMode = 'ofm';
+  const hasSlots = () => (map.getStyle().imports || []).length > 0;
+  function removePaths() {
+    for (const l of PATH_LAYERS) if (map.getLayer(l.id)) map.removeLayer(l.id);
+  }
+  function addPaths() {
+    const src = PATH_SOURCES[pathMode];
+    if (!map.getSource(src.id)) map.addSource(src.id, src.spec());
+    const vis = document.getElementById('paths').checked ? 'visible' : 'none';
+    for (const l of PATH_LAYERS) {
+      if (map.getLayer(l.id)) continue;
+      const f = l.f[pathMode];
+      const layer = {
+        id: l.id, type: 'line', source: src.id,
+        filter: pathMode === 'ofm' ? ['all', notIndoor, f] : f,
+        layout: { 'line-cap': 'round', 'line-join': 'round', visibility: vis },
+        paint: {
+          'line-color': l.color,
+          'line-width': ['interpolate', ['linear'], ['zoom'], ...l.w],
+          'line-emissive-strength': 1
+        }
+      };
+      if (src.sourceLayer) layer['source-layer'] = src.sourceLayer;
+      if (l.dash) layer.paint['line-dasharray'] = l.dash;
+      if (hasSlots()) layer.slot = 'middle';
+      map.addLayer(layer);
+    }
+  }
+  map.on('style.load', () => { addTerrain(); addPaths(); });
+  map.on('error', (e) => {
+    if (e.sourceId && e.sourceId.startsWith('osm-paths')) {
+      msg.style.display = 'block';
+      msg.textContent = '小道データの読み込みに失敗: ' + (e.error && e.error.message);
+    }
+  });
+  document.getElementById('paths').onchange = (e) => {
+    for (const l of PATH_LAYERS) {
+      if (map.getLayer(l.id)) map.setLayoutProperty(l.id, 'visibility', e.target.checked ? 'visible' : 'none');
+    }
+  };
+  document.getElementById('pathMode').onchange = (e) => {
+    pathMode = e.target.value;
+    msg.style.display = 'none';
+    removePaths();
+    addPaths();
+  };
+
+  // オービット: 中心を固定し、bearing を時間ベースで回す（フレームレート非依存）
+  let playing = true, speed = 6, last = null;
+  function frame(t) {
+    if (playing && last !== null) {
+      const dt = (t - last) / 1000;
+      map.setBearing((map.getBearing() + speed * dt + 360) % 360);
+    }
+    last = t;
+    requestAnimationFrame(frame);
+  }
+  map.on('load', () => requestAnimationFrame(frame));
+
+  // 操作中は自動回転を止め、離したら再開（ユーザーが一時停止中なら止めたまま）
+  let userPaused = false;
+  const setPlaying = (v) => {
+    playing = v;
+    document.getElementById('toggle').textContent = v ? '⏸ 一時停止' : '▶ 再生';
+  };
+  map.on('mousedown', () => { if (!userPaused) setPlaying(false); });
+  map.on('touchstart', () => { if (!userPaused) setPlaying(false); });
+  map.on('mouseup', () => { if (!userPaused) setPlaying(true); });
+  map.on('touchend', () => { if (!userPaused) setPlaying(true); });
+
+  document.getElementById('toggle').onclick = () => {
+    userPaused = playing;
+    setPlaying(!playing);
+  };
+  const bind = (id, fn) => {
+    const el = document.getElementById(id);
+    el.addEventListener('input', () => {
+      document.getElementById(id + 'Val').textContent = el.value;
+      fn(+el.value);
+    });
+  };
+  bind('speed', (v) => { speed = v; });
+  bind('pitch', (v) => map.setPitch(v));
+  bind('zoom', (v) => map.setZoom(v));
+  document.getElementById('style').onchange = (e) => map.setStyle(e.target.value);
+
+  // 手動でピッチ/ズームを変えたらスライダーに反映
+  map.on('pitch', () => {
+    const p = Math.round(map.getPitch());
+    document.getElementById('pitch').value = p;
+    document.getElementById('pitchVal').textContent = p;
+  });
+  map.on('zoom', () => {
+    const z = map.getZoom().toFixed(1);
+    document.getElementById('zoom').value = z;
+    document.getElementById('zoomVal').textContent = z;
+  });
+</script>
+</body>
+</html>

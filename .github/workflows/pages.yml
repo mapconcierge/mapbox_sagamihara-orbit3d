@@ -1,0 +1,42 @@
+# GitHub Pages へデプロイ。Mapbox の public token (pk.*) はリポジトリの Secret から config.js を生成して埋め込む。
+# 事前に Settings > Secrets and variables > Actions に MAPBOX_PUBLIC_TOKEN を登録し、
+# Mapbox アカウント側でそのトークンに URL 制限 (https://<user>.github.io/<repo>/*) を設定すること。
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Write config.js from secret
+        env:
+          MAPBOX_PUBLIC_TOKEN: ${{ secrets.MAPBOX_PUBLIC_TOKEN }}
+        run: |
+          case "$MAPBOX_PUBLIC_TOKEN" in
+            pk.*) ;;
+            *) echo "::error::Secret MAPBOX_PUBLIC_TOKEN が未設定、または pk. で始まる public token ではありません"; exit 1 ;;
+          esac
+          printf 'window.MAPBOX_TOKEN = "%s";\n' "$MAPBOX_PUBLIC_TOKEN" > config.js
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: .
+      - id: deployment
+        uses: actions/deploy-pages@v4

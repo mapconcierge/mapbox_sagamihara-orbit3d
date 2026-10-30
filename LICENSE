@@ -1,0 +1,11 @@
+CC0 1.0 Universal (Public Domain Dedication)
+
+このリポジトリのコード（index.html, scripts/）は CC0 1.0 によりパブリック・ドメインに献呈します。
+To the extent possible under law, the author has waived all copyright and related or
+neighboring rights to the code in this repository (index.html, scripts/).
+Legal code: https://creativecommons.org/publicdomain/zero/1.0/legalcode
+
+ただし、次のデータは CC0 ではありません / The following data is NOT CC0:
+  - raw/, processed/ : © OpenStreetMap contributors, Open Database License (ODbL) 1.0
+                       https://www.openstreetmap.org/copyright
+  - 実行時に取得するタイル/ Runtime tiles: Mapbox (Terms of Service), OpenFreeMap / OpenMapTiles
